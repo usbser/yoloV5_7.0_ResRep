@@ -1,12 +1,15 @@
+import os
+
 from torch import nn
 
-from compactor import CompactorLayer
+
 import numpy as np
 import torch.nn.functional as F
 import torch
-from misc import save_hdf5
+
 import sys
 sys.path.append("..")
+from ResRep.misc import save_hdf5
 from models.common import Conv
 from copy import deepcopy
 from utils.torch_utils import de_parallel
@@ -165,7 +168,10 @@ def compactor_convert(model, thresh, succ_strategy, save_path):
     model.cuda()
     for param in model.parameters():
         param.data = param.data.float()
-    model.fuse()
+    if int(os.getenv('RANK', -1)) != -1:
+        model.module.fuse()
+    else:
+        model.fuse()
     ckpt = {}
     for name, submodule in model.named_modules():
         if isinstance(submodule, Conv):

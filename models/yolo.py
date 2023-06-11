@@ -352,30 +352,21 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f]
 
         #  =====  resrep 为待剪枝的conv传入id ====
-        if iscompactor:
-            if m is Conv:
-                m_ = m(*args, cur_conv_idx=cur_conv_idx, iscompactor = iscompactor)
-                cur_conv_idx += 1
-            elif m is C3:
-                m_ = m(*args, cur_conv_idx=cur_conv_idx, iscompactor = iscompactor)
+        if m is Conv:
+            m_ = m(*args, cur_conv_idx=cur_conv_idx, iscompactor=iscompactor)
+            cur_conv_idx += 1
+        elif m is C3:
+            if i == 8 or i == 17 or i == 20 or i == 23: # 8 SPPF的前一个C3，17，20，23 head前的c3
+                m_ = m(*args, cur_conv_idx=cur_conv_idx, iscompactor=iscompactor, beforSPPF = True)
                 cur_conv_idx += (args[2]*2+3)
-            elif m is SPPF:
-                m_ = m(*args, cur_conv_idx=cur_conv_idx)
-                cur_conv_idx += 2
             else:
-                m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+                m_ = m(*args, cur_conv_idx=cur_conv_idx, iscompactor=iscompactor)
+                cur_conv_idx += (args[2]*2+3)
+        elif m is SPPF:
+            m_ = m(*args, cur_conv_idx=cur_conv_idx)
+            cur_conv_idx += 2
         else:
-            if m is Conv:
-                m_ = m(*args, cur_conv_idx=cur_conv_idx)
-                cur_conv_idx += 1
-            elif m is C3:
-                m_ = m(*args, cur_conv_idx=cur_conv_idx)
-                cur_conv_idx += (args[2]*2+3)
-            elif m is SPPF:
-                m_ = m(*args, cur_conv_idx=cur_conv_idx)
-                cur_conv_idx += 2
-            else:
-                m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
 
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in m_.parameters())  # number params

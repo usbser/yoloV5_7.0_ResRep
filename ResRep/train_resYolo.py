@@ -8,13 +8,13 @@ Usage - Single-GPU training:
     $ python train.py --data coco128.yaml --weights '' --cfg yolov5s.yaml --img 640  # from scratch
 
 Usage - Multi-GPU DDP training:
-    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 0,1,2,3
+    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 2,3,4,5
 
 Models:     https://github.com/ultralytics/yolov5/tree/master/models
 Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
-# python -m torch.distributed.run --nproc_per_node 2 --master_port 29505 /home/jinyi/yolov5_7.0/ResRep/train_resYolo.py --device 6,7
+# python -m torch.distributed.run --nproc_per_node 4 --master_port 29505 /home/jinyi/yolov5_7.0/ResRep/train_resYolo.py --device 2,3,4,5
 import argparse
 import math
 import os
@@ -335,23 +335,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             scaler.scale(loss).backward()
 
-            # ============== 为compactor增加L2正则项梯度 ===========
-            for compactor_param, mask in compactor_mask_dict.items():
-                compactor_param.grad.data = mask * compactor_param.grad.data
-                lasso_grad = compactor_param.data * (
-                            (compactor_param.data ** 2).sum(dim=(1, 2, 3), keepdim=True) ** (-0.5))
-                compactor_param.grad.data.add_(2e-2 #resrep_config.lasso_strength
-                                             , lasso_grad)
-            # ============== end 为compactor增加L2正则项梯度 ===========
-
-            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+            # 梯度裁剪 Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                # ============== 为compactor增加L2正则项梯度 ===========
+                for compactor_param, mask in compactor_mask_dict.items():
+                    # compactor_param.grad.data = compactor_param.grad.data * mask
+                    lasso_grad = compactor_param.data * (
+                            (compactor_param.data ** 2).sum(dim=(1, 2, 3), keepdim=True) ** (-0.5))
+                    compactor_param.grad.data.add_(1  # resrep_config.lasso_strength
+                                                   , lasso_grad)
+                # ============== end 为compactor增加L2正则项梯度 ===========
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)  # clip gradients
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
-                if ema:
+                if ema: # todo ema会减少惩罚项的影响
                     ema.update(model)
                 last_opt_step = ni
 
@@ -365,12 +364,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
-        if RANK in {-1, 0}:
-            all_compactor_weight = []  # 记录每一轮epoch后 compactor weight的l2分数的直方图
+        if RANK in {-1, 0} and epoch != 0:
+            all_compactor_weight_l2 = [] # 记录每一轮epoch后 compactor weight的l2分数的直方图
+            all_compactor_weight = []
             for compactor_param, mask in compactor_mask_dict.items():
                 store = compactor_param.clone()
                 metric_vec = np.sqrt(np.sum(store.cpu().detach().numpy() ** 2, axis=(1, 2, 3)))
-                all_compactor_weight.extend(metric_vec)
+                all_compactor_weight_l2.extend(metric_vec)
+                all_compactor_weight.extend(np.sum(store.cpu().detach().abs().numpy(), axis=(1, 2, 3)))
+            loggers.tb.add_histogram('bn_compactor_weight_l2/hist', np.array(all_compactor_weight_l2), epoch, bins='doane')
             loggers.tb.add_histogram('bn_compactor_weight/hist', np.array(all_compactor_weight), epoch, bins='doane')
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
@@ -469,14 +471,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     return results
 
 
-def parse_opt(known=False):
+def parse_opt(known=False): # --data ../data/coco128.yaml  --batch-size 32 --epochs 5 --workers 1
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5s.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
+    parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5s', help='initial weights path') #ROOT / './weights/yolov5s.pt'
+    parser.add_argument('--cfg', type=str, default=ROOT / '../models/yolov5s.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / '../data/coco.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / '../data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
-    parser.add_argument('--batch-size', type=int, default=32, help='total batch size for all GPUs, -1 for autobatch')
+    parser.add_argument('--batch-size', type=int, default=128, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
@@ -493,7 +495,7 @@ def parse_opt(known=False):
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=1, help='max dataloader workers (per RANK in DDP mode)')
+    parser.add_argument('--workers', type=int, default=2, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')

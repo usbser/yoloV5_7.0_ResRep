@@ -164,13 +164,13 @@ class CrossConv(nn.Module):
 
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, cur_conv_idx = None, iscompactor =False):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, cur_conv_idx = None, iscompactor =False, beforSPPF = False):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1, cur_conv_idx = cur_conv_idx, iscompactor = not shortcut and iscompactor )
         self.cv2 = Conv(c1, c_, 1, 1, cur_conv_idx = cur_conv_idx+1, iscompactor=iscompactor)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0, cur_conv_idx = cur_conv_idx+i*2+2,iscompactor=iscompactor) for i in range(n)))
-        self.cv3 = Conv(2 * c_, c2, 1, cur_conv_idx = cur_conv_idx+2+n*2)  # optional act=FReLU(c2)   #resrep 这一层不剪枝
+        self.cv3 = Conv(2 * c_, c2, 1, cur_conv_idx = cur_conv_idx+2+n*2, iscompactor=not beforSPPF)  # optional act=FReLU(c2)   #resrep 仅限于sppf层之前的c3不剪枝
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
