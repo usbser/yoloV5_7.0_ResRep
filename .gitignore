@@ -261,3 +261,7 @@ ResRep/runs
 ResRep/weights
 ResRep/test_code
 ResRep/test_value
+
+# DKD ---------
+DKD/runs
+DKD/weights

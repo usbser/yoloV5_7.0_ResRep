@@ -82,6 +82,8 @@ class Loggers():
             'x/lr0',
             'x/lr1',
             'x/lr2']  # params
+        if 'alpha' in hyp:
+            self.keys.insert(3,'train/dkd_loss')
         self.best_keys = ['best/epoch', 'best/precision', 'best/recall', 'best/mAP_0.5', 'best/mAP_0.5:0.95']
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary

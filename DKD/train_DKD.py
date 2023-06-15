@@ -8,14 +8,13 @@ Usage - Single-GPU training:
     $ python train.py --data coco128.yaml --weights '' --cfg yolov5s.yaml --img 640  # from scratch
 
 Usage - Multi-GPU DDP training:
-    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 2,3,4,5
+    $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 0,1,2,3
 
 Models:     https://github.com/ultralytics/yolov5/tree/master/models
 Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
-# python -m torch.distributed.run --nproc_per_node 4 --master_port 29505 /home/jinyi/yolov5_7.0/ResRep/train_resYolo.py --device 2,3,4,5
-# python -m torch.distributed.run --nproc_per_node 2 --master_port 29505 /home/jinyi/yolov5_7.0/ResRep/train_resYolo.py --device 6,7
+
 import argparse
 import math
 import os
@@ -35,8 +34,6 @@ import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
-from constants import yolo5s_succeeding
-
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -44,9 +41,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from resrep_convert import compactor_convert
-from resrep_util import get_compactor_mask_dict
-import val_resYolo as validate  # for end-of-epoch mAP
+import val as validate  # for end-of-epoch mAP
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
@@ -74,8 +69,9 @@ GIT_INFO = check_git_info()
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
-        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
+    # ====== 此处增加teacher模型的路径 ===========
+    save_dir, epochs, batch_size,teacher, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.teacher ,opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     callbacks.run('on_pretrain_routine_start')
 
@@ -119,17 +115,21 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-    is_coco = isinstance(val_path, str) and (val_path.endswith('coco/val2017.txt') or val_path.endswith('coco\\val2017.txt') )  # COCO dataset
+    is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
 
     # Model
     check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
-    if pretrained:
+    if pretrained:  # ====== 读取教师网络模型 ===============
+        Tckpt = torch.load(teacher, map_location='cpu')
+        teacherModel = Model(Tckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+        csd = Tckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+        csd = intersect_dicts(csd, teacherModel.state_dict())  # intersect
+        teacherModel.load_state_dict(csd, strict=False)  # load
+
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        if 'iscompactor' not in ckpt['model'].yaml:
-            ckpt['model'].yaml['iscompactor'] = True
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
@@ -255,7 +255,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Start training
     t0 = time.time()
     nb = len(train_loader)  # number of batches
-    nw = 0 #max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
+    nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
@@ -263,18 +263,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = ComputeLoss(model, DKD=True)  # =====让该类对DKD进行计算 ====== # init loss class
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
-
-    # ====  获取压缩层的参数 ==========
-    # 得到 一个dict key是compactor每一层的权重，value是对应的mask
-    # mask会被复制成和权重一样的维度大小（16，16，1，1）
-    compactor_mask_dict = get_compactor_mask_dict(model)
-    # ====  end 获取压缩层的参数 ==========
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -289,17 +283,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(4, device=device)  # mean losses  # =====增加DKDloss的记录===
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
-        pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'Instances', 'Size'))
+        pbar = enumerate(train_loader) # =====增加DKDloss的记录 由7改成8===
+        LOGGER.info(('\n' + '%11s' * 8) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'dkd_loss' , 'Instances', 'Size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-
-        # ============== 尝试剪枝，统计当前的剪枝情况 ===========
-        # ============== end尝试剪枝，统计当前的剪枝情况 ===========
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -324,10 +315,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
+            tpred = teacherModel(imgs) #========= 得到教师模型的计算结果 ===============
             # Forward
             with torch.cuda.amp.autocast(amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                pred = model(imgs)  # forward  # ========= 将教师模型的结果输入compute_loss ===============
+                loss, loss_items = compute_loss(pred, targets.to(device),tpred = tpred )  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -336,45 +328,28 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             scaler.scale(loss).backward()
 
-            # 梯度裁剪 Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
-                # ============== 为compactor增加L2正则项梯度 ===========
-                for compactor_param, mask in compactor_mask_dict.items():
-                    # compactor_param.grad.data = compactor_param.grad.data * mask
-                    lasso_grad = compactor_param.data * (
-                            (compactor_param.data ** 2).sum(dim=(1, 2, 3), keepdim=True) ** (-0.5))
-                    compactor_param.grad.data.add_(0.004  # resrep_config.lasso_strength
-                                                   , lasso_grad)
-                # ============== end 为compactor增加L2正则项梯度 ===========
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)  # clip gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
-                # if ema: # todo ema会减少惩罚项的影响
-                #     ema.update(model)
+                if ema:
+                    ema.update(model)
                 last_opt_step = ni
 
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                pbar.set_description(('%11s' * 2 + '%11.4g' * 6) %    #========= 5改成6 增加展示dkdloss的值=====
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
-        if RANK in {-1, 0} and epoch != 0:
-            all_compactor_weight_l2 = [] # 记录每一轮epoch后 compactor weight的l2分数的直方图
-            all_compactor_weight = []
-            for compactor_param, mask in compactor_mask_dict.items():
-                store = compactor_param.clone()
-                metric_vec = np.sqrt(np.sum(store.cpu().detach().numpy() ** 2, axis=(1, 2, 3)))
-                all_compactor_weight_l2.extend(metric_vec)
-                all_compactor_weight.extend(np.sum(store.cpu().detach().abs().numpy(), axis=(1, 2, 3)))
-            loggers.tb.add_histogram('bn_compactor_weight_l2/hist', np.array(all_compactor_weight_l2), epoch, bins='doane')
-            loggers.tb.add_histogram('bn_compactor_weight/hist', np.array(all_compactor_weight), epoch, bins='doane')
+
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
@@ -438,11 +413,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
-    if RANK in {-1, 0}:#打日志
+    if RANK in {-1, 0}:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
         for f in last, best:
             if f.exists():
-                # strip_optimizer(f)  # strip optimizers
+                strip_optimizer(f)  # strip optimizers
                 if f is best:
                     LOGGER.info(f'\nValidating {f}...')
                     results, _, _ = validate.run(
@@ -463,21 +438,20 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
         callbacks.run('on_train_end', last, best, epoch, results)
-    # ==================== 彻底压缩模型 =================
-    compactor_convert(model=model, thresh=1e-5 ,
-                      succ_strategy=yolo5s_succeeding,
-                      save_path=os.path.join(w, 'finish_converted.pt') )
-    # ==================== 彻底压缩模型 =================
+
     torch.cuda.empty_cache()
     return results
 
 
-def parse_opt(known=False): # --data ../data/coco128.yaml  --batch-size 32 --epochs 5 --workers 1
+def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5s.pt', help='initial weights path') #ROOT / './weights/yolov5s.pt'
-    parser.add_argument('--cfg', type=str, default=ROOT / '../models/yolov5s_resrep.yaml', help='model.yaml path')
-    parser.add_argument('--data', type=str, default=ROOT / '../data/coco.yaml', help='dataset.yaml path')
-    parser.add_argument('--hyp', type=str, default=ROOT / '../data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
+    # ======== 教师模型的路径 ====================
+    parser.add_argument('--teacher', type=str, default=ROOT / './weights/yolov5x.pt', help='initial weights path')
+
+    parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5s.pt', help='initial weights path')
+    parser.add_argument('--cfg', type=str, default=ROOT / '../models/yolov5s.yaml', help='model.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / '../data/coco128.yaml', help='dataset.yaml path')
+    parser.add_argument('--hyp', type=str, default=ROOT / '../data/hyps/hyp.scratch-low-DKD.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
@@ -496,7 +470,7 @@ def parse_opt(known=False): # --data ../data/coco128.yaml  --batch-size 32 --epo
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=3, help='max dataloader workers (per RANK in DDP mode)')
+    parser.add_argument('--workers', type=int, default=4, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
@@ -505,7 +479,7 @@ def parse_opt(known=False): # --data ../data/coco128.yaml  --batch-size 32 --epo
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
-    parser.add_argument('--save-period', type=int, default=10, help='Save checkpoint every x epochs (disabled if < 1)')
+    parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--seed', type=int, default=0, help='Global training seed')
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
 
@@ -520,10 +494,10 @@ def parse_opt(known=False): # --data ../data/coco128.yaml  --batch-size 32 --epo
 
 def main(opt, callbacks=Callbacks()):
     # Checks
-    # if RANK in {-1, 0}:
-    #     print_args(vars(opt))
-    #     check_git_status()
-    #     check_requirements(ROOT / 'requirements.txt')
+    if RANK in {-1, 0}:
+        print_args(vars(opt))
+        check_git_status()
+        check_requirements(ROOT / 'requirements.txt')
 
     # Resume (from specified or most recent last.pt)
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:

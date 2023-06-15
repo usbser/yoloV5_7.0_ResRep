@@ -170,10 +170,12 @@ def compactor_convert(model, thresh, succ_strategy, save_path):
         param.data = param.data.float()
     if int(os.getenv('RANK', -1)) != -1:
         model.module.fuse()
+        namemodel = model.module.named_modules()
     else:
         model.fuse()
+        namemodel = model.named_modules()
     ckpt = {}
-    for name, submodule in model.named_modules():
+    for name, submodule in namemodel:
         if isinstance(submodule, Conv):
             if hasattr(submodule, 'compactor'):
                 delattr(submodule, 'compactor')
