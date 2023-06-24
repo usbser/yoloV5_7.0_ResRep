@@ -265,3 +265,5 @@ ResRep/test_value
 # DKD ---------
 DKD/runs
 DKD/weights
+train_origin/run
+train_origin/weights
