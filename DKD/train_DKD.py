@@ -14,7 +14,8 @@ Models:     https://github.com/ultralytics/yolov5/tree/master/models
 Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
-
+# python -m torch.distributed.run --nproc_per_node 4 --master_port 29085 train_DKD.py  --img 640 --device 0,1,2,3
+# python -m torch.distributed.run --nproc_per_node 2 --master_port 29085 train_DKD.py  --img 640 --device 2,3 --batch-size 32
 import argparse
 import math
 import os
@@ -36,8 +37,8 @@ from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
+sys.path.append('/home/jinyi/yolov5_7.0')
 if str(ROOT) not in sys.path:
-    sys.path.append('/home/jinyi/yolov5_7.0')
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
@@ -126,7 +127,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         csd = Tckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, teacherModel.state_dict())  # intersect
         teacherModel.load_state_dict(csd, strict=False)  # load
-
+        teacherModel.eval()
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
@@ -319,7 +320,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Forward
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs)  # forward  # ========= 将教师模型的结果输入compute_loss ===============
-                loss, loss_items = compute_loss(pred, targets.to(device),tpred = tpred )  # loss scaled by batch_size
+                loss, loss_items = compute_loss(pred, targets.to(device),tpred = tpred[1] )  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -450,7 +451,7 @@ def parse_opt(known=False):
 
     parser.add_argument('--weights', type=str, default=ROOT / './weights/yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default=ROOT / '../models/yolov5s.yaml', help='model.yaml path')
-    parser.add_argument('--data', type=str, default=ROOT / '../data/coco128.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / '../data/coco.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / '../data/hyps/hyp.scratch-low-DKD.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='total batch size for all GPUs, -1 for autobatch')
@@ -479,7 +480,7 @@ def parse_opt(known=False):
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
-    parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
+    parser.add_argument('--save-period', type=int, default=-10, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--seed', type=int, default=0, help='Global training seed')
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
 
@@ -525,8 +526,10 @@ def main(opt, callbacks=Callbacks()):
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
+
     # DDP mode
     device = select_device(opt.device, batch_size=opt.batch_size)
+
     if LOCAL_RANK != -1:
         msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
         assert not opt.image_weights, f'--image-weights {msg}'
