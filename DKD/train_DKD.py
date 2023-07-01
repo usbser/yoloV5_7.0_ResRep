@@ -37,7 +37,7 @@ from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
-sys.path.append('/home/jinyi/yolov5_7.0')
+sys.path.append('/home/jy/yoloV5_7.0_ResRep')
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
